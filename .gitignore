@@ -1,0 +1,4 @@
+# Ignore SQLite database
+process_data.db
+# Ignore Log files
+*.log
