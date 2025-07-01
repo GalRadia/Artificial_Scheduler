@@ -16,45 +16,46 @@ import sqlite3
 import time
 import threading
 import xgboost as xgb
+import joblib
 from xgboost import XGBRegressor
 from joblib import load, dump
-
 # -------- Logger Setup --------
 faulthandler.enable()
 LOG_FILE = "ml_nice_adjuster.log"
+#
 logging.basicConfig(
     filename=LOG_FILE,
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
+
 log = logging.getLogger()
 
 # -------- Initialize Model --------
-modelTAT = xgb.Booster()
 
 try:
     # with open('modelForTAT.pkl', 'rb') as f:
         # modelTAT = pickle.load(f)
+        # dump(modelTAT, 'modelForTAT.joblib')  # save
         # modelTAT.get_booster().save_model("modelForTAT.json")  # save
-    modelTAT.load_model("modelForTAT.json")  # load
+    modelTAT = joblib.load("modelForTAT.joblib")
+    # joblib.dump(modelTAT, "modelForTAT.joblib")
 
-        # booster.load_model("modelForTAT.json")  # load
+    # booster.load_model("modelForTAT.json")  # load
 
     # with open('scaler.pkl', 'rb') as f:
         # scaler = pickle.load(f)
         # dump(scaler, 'scaler.joblib')  # save
-    scaler = load('scaler.joblib')
+    scaler = joblib.load('scaler.joblib')
 
     # with open('modelForPriorty.pkl', 'rb') as f:
         # best_kmeans = pickle.load(f)
         # dump(best_kmeans, 'modelForPriorty.joblib')  # save
-    best_kmeans = load('modelForPriorty.joblib')
+    best_kmeans = joblib.load('modelForPriorty.joblib')
 
 except Exception as e:
     log.error(f"Failed to load ML models: {e}")
-    print(
-        f"Error: Failed to load ML models.  Ensure they are in the correct directory.  Exiting.  Error Details: {e}")
     exit(1)
 
 
@@ -119,37 +120,90 @@ try:
         text INTEGER,
         rodata INTEGER,
         symtab INTEGER,                   
-        input_size INTEGER
+        input_size INTEGER,
+        retrained INTEGER DEFAULT 0
     )
     ''')
     conn.commit()
 except Exception as e:
     log.error(f"Failed to initialize database: {e}")
-    print(
-        f"Error: Failed to initialize database.  Exiting. Error Details: {e}")
     exit(1)
 
-# -------- Track PID start times --------
+# -------- Global Variables --------
+# Global dictionary to store process start times and info
 pid_start_times = {}
-# labels_dict = {
-#     0: (5, 12),
-#     1: (13, 18),
-#     2: (-11, -4),
-#     3: (-19, -12),
-#     4: (-3, 4)
-# }
 labels_dict = {
     0: (-5, -2),
-    1: (-1, 1),
+    1: (-1, 1), # IO
     2: (-15, -11),
     3: (-19, -16),
     4: (-10, -6)
 }
 high_priority = 0
+SKIP_HELPERS = {
+    "tr", "uniq", "awk", "sed", "cut", "head", "tail", "sort", "true", "false",
+    "watch", "manpath", "gitstatusd-linux", "xargs", "grep", "stty", "mkfifo",
+    "sleep", "uname", "dirname", "basename", "readlink", "pwd", "git",
+    "find", "node", "gitstatusd-linu", "env", "printf", "echo", "cat", "ps",
+    "renice", "size", "readelf", "bash", "zsh", "python3", "python", "gcc",
+    "g++", "ld", "ld.bfd", "ld.gold", "ld-new", "ld-2.31.so", "sed", "ps",
+}
 # -------- ML Model --------
 
 
 def get_nice_from_model(proc_info, creation_time):
+    # df = pd.DataFrame([proc_info])
+    # df = df.drop(columns=['pid',])
+
+    # df_model1 = df[['memory_vms', 'memory_data', 'io_write_count',
+    #                 'bss', 'data', 'dynamic', 'dynstr', 'eh_frame', 'eh_frame_hdr',
+    #                 'fini', 'fini_array', 'gnu.version', 'gnu.version_r', 'got',
+    #                 'init', 'init_array', 'plt', 'rela.dyn', 'rela.plt',
+    #                 'shstrtab', 'strtab', 'text', 'input_size']].copy()
+    # df_model1['vmsXmemorydata'] = df_model1['memory_vms'] * \
+    #     df_model1['memory_data']
+    # df_model1['squaredmemorydata'] = df_model1['memory_data'] ** 2
+    # df_model1['memorydata'] = df_model1['memory_data'] ** 4
+    # df_model1['memory_vmslog'] = np.sqrt(df_model1['memory_vms'])
+    # df_model1['memory_datasin'] = np.sin(df_model1['memory_data']) ** 2
+    # df_model1["textXmemory_data"] = np.log(df_model1["memory_data"]) ** 2
+    df,df_model1 = get_df_for_TAT(proc_info)
+    df_model1_scaled = scaler.fit_transform(df_model1)
+
+    dmatrix_input = xgb.DMatrix(df_model1_scaled)
+    tat_predict = modelTAT.predict(dmatrix_input)
+
+    # tat_predict = modelTAT.predict(df_model1_scaled)
+
+    df['tat_predicted'] = tat_predict
+
+    # lb = sklearn.preprocessing.LabelEncoder()
+    # df["status"] = lb.fit_transform(df["status"])
+    df['io_write_count'] = df['io_write_count'] * 250
+    desired_columns = [
+        'io_read_count', 'io_write_count', 'io_write_bytes', 'bss', 'data',
+        'dynamic', 'dynstr', 'eh_frame', 'eh_frame_hdr', 'fini', 'fini_array',
+        'gnu.version', 'gnu.version_r', 'got', 'init', 'init_array', 'plt',
+        'rela.dyn', 'rela.plt', 'shstrtab', 'strtab', 'text', 'input_size',
+        'tat_predicted'
+    ]
+    df = df[[col for col in desired_columns if col in df.columns]]
+    label = best_kmeans.predict(df)
+    if label == 3:
+        global high_priority
+        if high_priority == 3:
+            label = 2
+        else:
+            high_priority += 1
+    log.debug(f"[ML] KMeans label: {label}")
+    label = label[0]
+    nice_val = get_nice(label)
+    pid_start_times[proc_info['pid']] = (
+        creation_time, proc_info, nice_val, label, tat_predict)
+    log.debug(f"[ML] Predicted nice value: {nice_val}")
+    return nice_val
+
+def get_df_for_TAT(proc_info):
     df = pd.DataFrame([proc_info])
     df = df.drop(columns=['pid',])
 
@@ -164,45 +218,8 @@ def get_nice_from_model(proc_info, creation_time):
     df_model1['memorydata'] = df_model1['memory_data'] ** 4
     df_model1['memory_vmslog'] = np.sqrt(df_model1['memory_vms'])
     df_model1['memory_datasin'] = np.sin(df_model1['memory_data']) ** 2
-    df_model1["textXmemory_data"] = np.log(df_model1["memory_data"]) ** 2
-
-    df_model1_scaled = scaler.fit_transform(df_model1)
-
-    dmatrix_input = xgb.DMatrix(df_model1_scaled)
-    tat_predict = modelTAT.predict(dmatrix_input)
-
-    # tat_predict = modelTAT.predict(df_model1_scaled)
-
-    df['tat_predicted'] = tat_predict
-
-    # lb = sklearn.preprocessing.LabelEncoder()
-    # df["status"] = lb.fit_transform(df["status"])
-    df['io_write_count']= df['io_write_count'] * 250
-    desired_columns = [
-        'io_read_count', 'io_write_count', 'io_write_bytes', 'bss', 'data',
-        'dynamic', 'dynstr', 'eh_frame', 'eh_frame_hdr', 'fini', 'fini_array',
-        'gnu.version', 'gnu.version_r', 'got', 'init', 'init_array', 'plt',
-        'rela.dyn', 'rela.plt', 'shstrtab', 'strtab', 'text', 'input_size',
-        'tat_predicted'
-    ]
-    df = df[[col for col in desired_columns if col in df.columns]]
-    df['io_read_count']
-    label = best_kmeans.predict(df)
-    if label == 3:
-        global high_priority
-        if high_priority == 3:
-            label = 2
-        else:
-            high_priority += 1
-    log.info(f"[ML] KMeans label: {label}")
-    label = label[0]
-    nice_val = get_nice(label)
-    pid_start_times[proc_info['pid']] = (
-        creation_time, proc_info, nice_val, label, tat_predict)
-    log.info(f"[ML] Predicted nice value: {nice_val}")
-    return nice_val
-
-# -------- ELF Section Size Parser --------
+    df_model1["textXmemory_data"] = np.log(df_model1["memory_data"]) ** 2    
+    return df,df_model1
 
 
 def get_nice(label):
@@ -257,7 +274,7 @@ def get_elf_data(file_path):
     except Exception as e:
         log.error(f"[ELF] Failed to parse with size: {e}")
 
-    log.info(f"[ELF] Parsed ELF data for {file_path}: {elf_data}")
+    log.debug(f"[ELF] Parsed ELF data for {file_path}: {elf_data}")
     return elf_data
 
 
@@ -307,8 +324,6 @@ try:
 
 except Exception as e:
     log.error(f"Failed to load or attach eBPF program: {e}")
-    print(
-        f"Error: Failed to load or attach eBPF program.  Exiting.  Error Details: {e}")
     exit(1)
 
 # -------- C struct for events --------
@@ -325,90 +340,106 @@ def handle_exec(cpu, data, size):
     event = ctypes.cast(data, ctypes.POINTER(Data)).contents
     name = event.comm.decode("utf-8")
     pid = event.pid
+    try:
+        tty = os.readlink(f"/proc/{pid}/fd/0")
+    except Exception:
+        tty = None  # Could be permission denied or process has exited
+
+    if not tty or (not tty.startswith("/dev/pts/") and not tty.startswith("/dev/tty")):
+        log.debug(
+            f"[DEBUG] Skipping non-interactive process: {name} (PID {pid})")
+        return
+    SKIP_HELPERS = {
+        "tr", "uniq", "awk", "sed", "cut", "head", "tail", "sort", "true", "false",
+        "watch", "manpath", "gitstatusd-linux", "xargs", "grep", "stty", "mkfifo",
+        "sleep", "uname", "dirname", "basename", "readlink", "pwd", "git",
+        "find", "node", "gitstatusd-linu", "env", "printf", "echo", "cat", "ps",
+        "renice", "size", "readelf", "bash", "zsh", "python3", "python", "gcc",
+        "g++", "ld", "ld.bfd", "ld.gold", "ld-new", "ld-2.31.so", "sed", "ps",
+    }
     # skip_names = {"renice", "sh", "size", "readelf","cat", "bash", "python3", "python", "gcc", "g++", "ld", "ld.bfd", "ld.gold", "ld-new", "ld-2.31.so","sed","ps"}
-    skip_names = {"renice", "sh", "size", "readelf","zsh"}
+    skip_names = {"renice", "stty", "sh", "size", "readelf", "zsh", "python3", "docker", "docker-init", "docker-proxy", "docker-containerd-shim", "bash", "python3.10", "python3.11", "python3.12", "python3.13",
+                  "gcc", "g++", "ld", "ld.bfd", "ld.gold", "ld-new", "ld-2.31.so", "sed", "ps", "gitstatusd-linux", "gitstatusd-linu", "ldconfig", "env", "printf", "echo", "cat", "python", "ldconfig.real", }
     if name in skip_names:
         return
 
     try:
         proc = psutil.Process(pid)
-        if proc.terminal() and proc.name() not in skip_names:
-            print(f"[eBPF] Target process: {name} (PID {pid})")
-            log.info(f"[eBPF] Detected new process: {name} (PID {pid})")
+        # if not is_interactive_command(proc):
+        #     return
 
-            try:
-                binary_path = os.readlink(f"/proc/{pid}/exe")
-                elf_info = get_elf_data(binary_path)
+        log.info(f"[eBPF] Detected new process: {name} (PID {pid})")
 
-                psutil.cpu_percent(interval=0.1)
-                proc.cpu_percent(interval=0.1)
+        try:
+            binary_path = os.readlink(f"/proc/{pid}/exe")
+            elf_info = get_elf_data(binary_path)
 
-                memory_info = proc.memory_info()
-                memory_ext_info = proc.memory_full_info()
-                io_counters = proc.io_counters()
-                open_files = proc.open_files()
-                threads = proc.threads()
-                env_vars = proc.environ()
-                status = proc.status()
-                connections = proc.connections()
+            psutil.cpu_percent(interval=0.1)
+            proc.cpu_percent(interval=0.1)
 
-                proc_info = {
-                    "pid": pid,
-                    "name": name,
-                    "binary_path": binary_path,
-                    "cpu_affinity": json.dumps(proc.cpu_affinity()),
-                    "cpu_num": proc.cpu_num(),
-                    "cpu_percent": proc.cpu_percent(),
-                    "cpu_times": json.dumps(proc.cpu_times()),
-                    "memory_rss": memory_info.rss,
-                    "memory_vms": memory_info.vms,
-                    "memory_shared": memory_info.shared,
-                    "memory_data": memory_ext_info.data,
-                    "io_read_count": io_counters.read_count,
-                    "io_write_count": io_counters.write_count,
-                    "io_read_bytes": io_counters.read_bytes,
-                    "io_write_bytes": io_counters.write_bytes,
-                    "open_files": len(open_files),
-                    "connections": len(connections),
-                    "threads": len(threads),
-                    "env_vars": len(env_vars),
-                    "status": status,
-                    **elf_info
-                }
+            memory_info = proc.memory_info()
+            memory_ext_info = proc.memory_full_info()
+            io_counters = proc.io_counters()
+            open_files = proc.open_files()
+            threads = proc.threads()
+            env_vars = proc.environ()
+            status = proc.status()
+            connections = proc.connections()
 
-                log.info(f"[INFO] Process info: {proc_info}")
+            proc_info = {
+                "pid": pid,
+                "name": name,
+                "binary_path": binary_path,
+                "cpu_affinity": json.dumps(proc.cpu_affinity()),
+                "cpu_num": proc.cpu_num(),
+                "cpu_percent": proc.cpu_percent(),
+                "cpu_times": json.dumps(proc.cpu_times()),
+                "memory_rss": memory_info.rss,
+                "memory_vms": memory_info.vms,
+                "memory_shared": memory_info.shared,
+                "memory_data": memory_ext_info.data,
+                "io_read_count": io_counters.read_count,
+                "io_write_count": io_counters.write_count,
+                "io_read_bytes": io_counters.read_bytes,
+                "io_write_bytes": io_counters.write_bytes,
+                "open_files": len(open_files),
+                "connections": len(connections),
+                "threads": len(threads),
+                "env_vars": len(env_vars),
+                "status": status,
+                **elf_info
+            }
 
-                nice_val = get_nice_from_model(proc_info, proc.create_time())
-                os.system(f"renice -n {nice_val} -p {pid}")
-                # nice_val=0
-                log.info(
-                    f"[RENICE] Applied nice={nice_val} to PID {pid} name={name}")
-                print(f"[+] Set nice={nice_val} for PID {pid}")
+            log.debug(f"[INFO] Process info: {proc_info}")
 
-                # start_time = proc.create_time()
-                # creation_time, proc_info, nice_val, label, tat_predict
-                # pid_start_times[pid] = (start_time, proc_info, nice_val,-1,-1)
+            nice_val = get_nice_from_model(proc_info, proc.create_time())
+            os.system(f"renice -n {nice_val} -p {pid}")
+            # nice_val=0
+            log.info(
+                f"[RENICE] Applied nice={nice_val} to PID {pid} name={name}")
 
-            except FileNotFoundError:
-                log.warning(
-                    f"[WARNING] Could not access /proc/{pid}/exe for {name} (PID {pid}). Skipping ELF analysis.")
-            except psutil.NoSuchProcess:
-                log.warning(
-                    f"[WARNING] Process {name} (PID {pid}) disappeared before full info could be collected.")
-            except Exception as e:
-                error_msg = f"[ERROR] Failed to get detailed info for PID {pid} ({name}): {e}" + traceback.format_exc(
-                )
-                log.error(error_msg)
-                print(error_msg)
+            # start_time = proc.create_time()
+            # creation_time, proc_info, nice_val, label, tat_predict
+            # pid_start_times[pid] = (start_time, proc_info, nice_val,-1,-1)
+
+        except FileNotFoundError:
+            log.warning(
+                f"Could not access /proc/{pid}/exe for {name} (PID {pid}). Skipping ELF analysis.")
+        except psutil.NoSuchProcess:
+            log.warning(
+                f"Process {name} (PID {pid}) disappeared before full info could be collected.")
+        except Exception as e:
+            error_msg = f"[ERROR] Failed to get detailed info for PID {pid} ({name}): {e}" + traceback.format_exc(
+            )
+            log.error(error_msg)
 
     except psutil.NoSuchProcess:
         log.warning(
-            f"[WARNING] Process {name} (PID {pid}) disappeared immediately after exec.")
+            f"Process {name} (PID {pid}) disappeared immediately after exec.")
     except Exception as e:
         error_msg = f"[ERROR] Failed to handle exec PID {pid} ({name}): {e}" + \
             traceback.format_exc()
         log.error(error_msg)
-        print(error_msg)
 
 
 def handle_exit(cpu, data, size):
@@ -505,12 +536,10 @@ def handle_exit(cpu, data, size):
                 'input_size': proc_info['input_size'],
             })
             conn.commit()
-
-            print(f"[+] Stored process {pid} with TaT {tat:.2f}s in database.")
+            log.info(
+                f"[DB] Stored process {pid} with TAT {tat:.2f}s in database.")
         except Exception as e:
             log.error(f"Failed to insert process data into database: {e}")
-            print(
-                f"Error: Failed to insert process data into database. Error Details: {e}")
 
 
 def reballance_nice():
@@ -522,7 +551,7 @@ def reballance_nice():
     #     pid_start_times[pid] = (pid_start_times[pid][0],
     #                             pid_start_times[pid][1], new_nice)
     #     os.system(f"renice -n {new_nice} -p {pid}")
-    #     log.info(f"[REBALANCE] Adjusted nice={new_nice} for PID {pid}")
+    #     log.debug(f"[REBALANCE] Adjusted nice={new_nice} for PID {pid}")
     #     print(f"[+] Rebalanced nice={new_nice} for PID {pid}")
     if not pid_start_times:
         log.info("[REBALANCE] No processes to rebalance.")
@@ -551,7 +580,7 @@ def reballance_nice():
         )
 
         sorted_labels[label] = sorted_list
-        log.info(
+        log.debug(
             f"[REBALANCE] Sorted PIDs for label {label}: {[pid for pid, _ in sorted_list]}")
 
         # Rebalance nice values
@@ -568,7 +597,6 @@ def reballance_nice():
             # Apply system-level nice change
             os.system(f"renice -n {new_nice} -p {pid}")
             log.info(f"[REBALANCE] Set nice={new_nice} for PID {pid}")
-            print(f"[+] Rebalanced PID {pid} to nice={new_nice}")
 
 
 rebalance_timer = None
@@ -581,10 +609,45 @@ def loop_reballance():
     rebalance_timer.start()
 
 
-# -------- Main Loop --------
-print("🔍 Listening for target processes...")
-log.info("Started ML nice adjuster daemon.")
 
+
+
+def is_interactive_command(proc):
+    try:
+        if not has_controlling_terminal(proc.pid):
+            return False
+
+        parent = proc.parent()
+        if not parent or parent.name() not in {"bash", "zsh", "fish"}:
+            return False
+
+        if any(helper in proc.name() for helper in SKIP_HELPERS):
+            return False
+
+        cmdline = proc.cmdline()
+        if len(cmdline) <= 1:
+            return False
+
+        return True
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return False
+
+
+def has_controlling_terminal(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().split()
+            tty_nr = int(fields[6])  # 7th field: tty_nr
+            log.debug(
+                f"[DEBUG_HAS_CONTROLLING_TERMINAL] tty_nr: {tty_nr}\n fields:{fields}")
+            return tty_nr != 0
+    except:
+        return False
+
+
+# -------- Main Loop --------
+log.info("Started ML nice adjuster daemon.")
+print("Started ML nice adjuster daemon.")
 
 b["events_exec"].open_perf_buffer(handle_exec)
 
@@ -602,19 +665,14 @@ except KeyboardInterrupt:
     if rebalance_timer:
         rebalance_timer.cancel()
     print("Exiting.")
-    log.info("Shutting down.")
     conn.close()
     print("connection closed.")
-    log.info("Closing database connection.")
     b.detach_tracepoint(tp=b"sched:sched_process_exec")
     b.detach_tracepoint(tp=b"sched:sched_process_exit")
     b.detach_tracepoint(tp=b"sched:sched_process_fork")
     print("eBPF tracepoints detached.")
-    log.info("eBPF tracepoints detached.")
     b.cleanup()
     print("eBPF program cleaned up.")
-    log.info("eBPF program cleaned up.")
-    log.info("Log file closed.")
     print("Exiting gracefully.")
 
 except Exception as e:
@@ -629,3 +687,102 @@ except Exception as e:
     #     got, init, init_array, plt, got.plt, rela_dyn, rela_plt, shstrtab, jcr, note.ABI-tag, note.gnu.build-id, rodata,
     #     strtab, symtab, text, input_size
     # ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) 52
+
+# -------- Incremental Retrain Function --------
+# Retrain the xgboost model with new data
+# Function to incrementally train the model
+
+
+def incremental_retrain():
+    # now = time.time()
+
+    # if now - last_incremental_train_time < INCREMENTAL_TRAIN_INTERVAL:
+    #     return  # Not time yet
+    modelTAT = joblib.load("modelForTAT.joblib")
+    booster = modelTAT.get_booster()
+    scaler_new = load('scaler.joblib')
+    best_kmeans_new = load('modelForPriorty.joblib')
+
+
+    try:
+        log.info("[INCREMENTAL] Attempting incremental training...")
+        df_new = pd.read_sql_query(
+            "SELECT * FROM processes WHERE retrained = 0 AND tat IS NOT NULL", conn)
+
+        if df_new.empty:
+            log.info("[INCREMENTAL] No new data to train on.")
+            return
+
+        features = [
+            'memory_vms', 'memory_data', 'io_write_count', 'bss', 'data', 'dynamic',
+            'dynstr', 'eh_frame', 'eh_frame_hdr', 'fini', 'fini_array',
+            'gnu_version', 'gnu_version_r', 'got', 'init', 'init_array', 'plt',
+            'rela_dyn', 'rela_plt', 'shstrtab', 'strtab', 'text', 'input_size'
+        ]
+
+        X_new = df_new[features].copy()
+        X_new['vmsXmemorydata'] = X_new['memory_vms'] * X_new['memory_data']
+        X_new['squaredmemorydata'] = X_new['memory_data'] ** 2
+        X_new['memorydata'] = X_new['memory_data'] ** 4
+        X_new['memory_vmslog'] = np.sqrt(X_new['memory_vms'])
+        X_new['memory_datasin'] = np.sin(X_new['memory_data']) ** 2
+        X_new["textXmemory_data"] = np.log(
+            X_new["memory_data"].replace(0, 1)) ** 2
+        y_new = df_new["tat"]
+
+        X_new_scaled = scaler.transform(X_new)
+        config = json.loads(modelTAT.save_config())
+        config["learner"]["gradient_booster"]["tree_train_param"]["learning_rate"] = "0.05"
+        num_trees = int(config["learner"]["gradient_booster"]["gbtree_model_param"]["num_trees"])
+        config["learner"]["gradient_booster"]["gbtree_model_param"]["num_trees"] = str(num_trees + 5)
+        tree_params = config["learner"]["gradient_booster"]["tree_train_param"]
+        model_params = {
+            "learning_rate": float(tree_params["learning_rate"]),
+            "max_depth": int(tree_params["max_depth"]),
+            "min_child_weight": float(tree_params["min_child_weight"]),
+            "gamma": float(tree_params["gamma"]),
+            "subsample": float(tree_params["subsample"]),
+            "colsample_bytree": float(tree_params["colsample_bytree"]),
+            "reg_alpha": float(tree_params.get("reg_alpha", 0)),
+            "reg_lambda": float(tree_params.get("reg_lambda", 1)),
+            "n_estimators": int(config["learner"]["gradient_booster"]["gbtree_model_param"]["num_trees"]),
+            "objective": config["learner"]["learner_train_param"]["objective"],
+            "tree_method": config["learner"]["gradient_booster"]["gbtree_train_param"]["tree_method"]
+        }
+        new_model_TAT = XGBRegressor(**model_params)
+        new_model_TAT.fit(X_new_scaled, y_new,booster=booster)
+        new_model_TAT.dump_model("modelForTAT.joblib", dump_format="joblib")
+        # Mark data as retrained
+        cursor.execute(
+            "UPDATE processes SET retrained = 1 WHERE retrained = 0")
+        conn.commit()
+        tat_predict = new_model_TAT.predict(X_new_scaled)
+        df_new['tat_predicted'] = tat_predict
+
+        # lb = sklearn.preprocessing.LabelEncoder()
+        # df["status"] = lb.fit_transform(df["status"])
+        df_new['io_write_count'] = df_new['io_write_count'] * 250
+        desired_columns = [
+            'io_read_count', 'io_write_count', 'io_write_bytes', 'bss', 'data',
+            'dynamic', 'dynstr', 'eh_frame', 'eh_frame_hdr', 'fini', 'fini_array',
+            'gnu.version', 'gnu.version_r', 'got', 'init', 'init_array', 'plt',
+            'rela.dyn', 'rela.plt', 'shstrtab', 'strtab', 'text', 'input_size',
+            'tat_predicted'
+        ]
+        df = df_new[[col for col in desired_columns if col in df_new.columns]]
+        best_kmeans.partial_fit(df)
+
+
+
+
+
+
+
+
+
+
+
+
+        log.info("[INCREMENTAL] Model updated incrementally with new data.")
+    except Exception as e:
+        log.error(f"[INCREMENTAL] Error during incremental training: {e}")
