@@ -2,6 +2,7 @@ from .ebpf_utils import setup_ebpf, detach_ebpf, poll_events
 from .rebalance import loop_rebalance,cancel_rebalance
 from .db import close_db,init_db
 from .config import log
+from .handlers import loop_retrain
 
 if __name__ == "__main__":
     log.info("Started ML nice adjuster daemon.")
@@ -10,6 +11,9 @@ if __name__ == "__main__":
         init_db()
         setup_ebpf()
         loop_rebalance()
+        log.debug("Starting retrain loop.")
+        # loop_retrain()  # Start the retrain loop
+        log.debug("end of retrain loop.")
         poll_events()
     except KeyboardInterrupt:
         log.info("KeyboardInterrupt received, shutting down.")

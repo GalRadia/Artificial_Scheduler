@@ -3,6 +3,8 @@ import ctypes
 import traceback
 import psutil
 import subprocess
+import threading
+
 from .elf_utils import get_elf_data
 from .model import ModelManager
 from .rebalance import pid_start_times
@@ -91,3 +93,22 @@ def handle_exit(cpu, data, size):
             model_manager.high_priority -= 1
         insert_into_db(start_time,nice_val,label,tat_predict,proc_info)
         log.info(f"[EXIT] Process {pid} ended, removed from tracking.")
+def retrain_model():
+    log.debug("[RETRAIN] Starting model retraining.")
+    try:
+        model_manager.incremental_retrain()
+    except Exception as e:
+        log.error(f"[RETRAIN] Failed to retrain model: {e}\n{traceback.format_exc()}")
+    else:
+        log.info("[RETRAIN] Model retrained successfully.")
+retrain_timer = None
+def loop_retrain():
+    """
+    Periodically retrain the model with new data.
+    This function can be called in a separate thread or as part of a scheduled task.
+    """
+    global retrain_timer
+    log.debug("[RETRAIN] Starting retrain loop.")
+    retrain_model()
+    retrain_timer = threading.Timer(30, loop_retrain)  # Retrain every 60 seconds
+    retrain_timer.start()
