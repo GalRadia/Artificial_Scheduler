@@ -102,7 +102,7 @@ def insert_into_db(start_time, nice_val ,label,tat_predict,proc_info):
             )
         ''', {
             'pid': proc_info['pid'],
-            'name': proc_info['name'] + " with_ml_new",
+            'name': proc_info['name'] ,
             'cpu_affinity': proc_info['cpu_affinity'],
             'cpu_num': proc_info['cpu_num'],
             'cpu_percent': proc_info['cpu_percent'],
