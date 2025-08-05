@@ -3,13 +3,11 @@ import ctypes
 import traceback
 import psutil
 import subprocess
-import threading
-
 from .elf_utils import get_elf_data
 from .model import ModelManager
-from .rebalance import pid_start_times
+from .rebalance import pid_start_times, signal_process_exit
 from .config import log, SKIP_HELPERS, HIGH_PRIORITY_LABEL
-from .db import insert_into_db
+from .db import insert_into_db, should_retrain_model
 
 model_manager = ModelManager()
 
@@ -23,21 +21,24 @@ def handle_exec(cpu, data, size):
     name = event.comm.decode("utf-8")
     pid = event.pid
     try:
-        tty = os.readlink(f"/proc/{pid}/fd/0")
+        tty = os.readlink(f"/proc/{pid}/fd/0")  # Read the terminal link
     except Exception:
         tty = None  # Could be permission denied or process has exited
 
     if not tty or (not tty.startswith("/dev/pts/") and not tty.startswith("/dev/tty")):
-        log.debug(
-            f"[DEBUG] Skipping non-interactive process: {name} (PID {pid})")
+        # Remove this debug log - too noisy
         return
 
     if name in SKIP_HELPERS:
         return
 
     try:
-
+        # Check if process still exists and is accessible
         proc = psutil.Process(pid)
+        if proc.status() == psutil.STATUS_ZOMBIE:
+            # Remove debug log - too noisy for zombie processes
+            return
+
         binary_path = os.readlink(f"/proc/{pid}/exe")
         elf_info = get_elf_data(binary_path)
         psutil.cpu_percent(interval=0.1)
@@ -70,14 +71,22 @@ def handle_exec(cpu, data, size):
 
         nice_val = model_manager.predict_nice(
             proc_info, proc.create_time(), pid_start_times)
-        subprocess.run(['renice',str(nice_val),'-p',str(pid)],stdout=subprocess.DEVNULL)
-        # os.system(f"renice -n {nice_val} -p {pid}")
 
-        # nice_val = 0
-        # pid_start_times[proc_info['pid']] = (
-        #     proc.create_time(), proc_info, nice_val, -1, -1)
+        # Apply renice with error handling
+        try:
+            result = subprocess.run(['renice', str(nice_val), '-p', str(pid)],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                    text=True, timeout=5)
+            if result.returncode != 0:
+                log.warning(
+                    f"[RENICE] Failed to renice PID {pid}: {result.stderr}")
+        except subprocess.TimeoutExpired:
+            log.warning(f"[RENICE] Timeout renicing PID {pid}")
+        except Exception as renice_error:
+            log.warning(f"[RENICE] Error renicing PID {pid}: {renice_error}")
 
-        log.info(f"[RENICE] Applied nice={nice_val} to PID {pid} ({name})")
+        # Convert to debug - this happens frequently
+        log.debug(f"[RENICE] Applied nice={nice_val} to PID {pid} ({name})")
     except Exception as e:
         log.error(
             f"[EXEC] Failed for PID {pid}: {e}\n{traceback.format_exc()}")
@@ -88,27 +97,25 @@ def handle_exit(cpu, data, size):
     pid = event.pid
 
     if pid in pid_start_times:
-        start_time, proc_info, nice_val ,label,tat_predict= pid_start_times.pop(pid) 
+        start_time, proc_info, nice_val, label, tat_predict = pid_start_times.pop(
+            pid)
         if label == HIGH_PRIORITY_LABEL:
             model_manager.high_priority -= 1
-        insert_into_db(start_time,nice_val,label,tat_predict,proc_info)
-        log.info(f"[EXIT] Process {pid} ended, removed from tracking.")
+        insert_into_db(start_time, nice_val, label, tat_predict, proc_info)
+        signal_process_exit()  # Signal that a process exited
+        # Convert to debug - this happens for every process exit
+        log.debug(f"[EXIT] Process {pid} ended, removed from tracking.")
+
+
 def retrain_model():
-    log.debug("[RETRAIN] Starting model retraining.")
-    try:
-        model_manager.incremental_retrain()
-    except Exception as e:
-        log.error(f"[RETRAIN] Failed to retrain model: {e}\n{traceback.format_exc()}")
+    if should_retrain_model():
+        # Keep as info - important event
+        log.info("[RETRAIN] Starting model retraining...")
+        try:
+            model_manager.incremental_retrain()
+        except Exception as e:
+            log.error(
+                f"[RETRAIN] Failed to retrain model: {e}\n{traceback.format_exc()}")
     else:
-        log.info("[RETRAIN] Model retrained successfully.")
-retrain_timer = None
-def loop_retrain():
-    """
-    Periodically retrain the model with new data.
-    This function can be called in a separate thread or as part of a scheduled task.
-    """
-    global retrain_timer
-    log.debug("[RETRAIN] Starting retrain loop.")
-    retrain_model()
-    retrain_timer = threading.Timer(30, loop_retrain)  # Retrain every 60 seconds
-    retrain_timer.start()
+        # Convert to debug - only log at info when actually retraining
+        log.debug("[RETRAIN] No need to retrain model.")

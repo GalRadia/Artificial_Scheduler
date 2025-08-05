@@ -15,6 +15,7 @@ struct data_t {
 BPF_PERF_OUTPUT(events_exec);
 BPF_PERF_OUTPUT(events_exit);
 
+// This function is called when a process is executed
 int on_exec(struct tracepoint__sched__sched_process_exec *ctx) {
     struct data_t data = {};
     data.pid = bpf_get_current_pid_tgid() >> 32;
@@ -23,6 +24,7 @@ int on_exec(struct tracepoint__sched__sched_process_exec *ctx) {
     return 0;
 }
 
+// This function is called when a process exits
 int on_exit(struct tracepoint__sched__sched_process_exit *ctx) {
     struct data_t data = {};
     data.pid = bpf_get_current_pid_tgid() >> 32;

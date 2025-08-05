@@ -1,11 +1,12 @@
 import pandas as pd
 import numpy as np
 import joblib
-from xgboost import XGBRegressor, DMatrix
-from .config import log, LABELS_DICT, MODEL_TAT_PATH, SCALER_PATH, KMEANS_PATH
-from .db import conn, cursor
+from xgboost import XGBRegressor
+from .config import HIGH_PRIORITY_LABEL, SECONDARY_PRIORITY_LABEL, log, LABELS_DICT, MODEL_TAT_PATH, SCALER_PATH, KMEANS_PATH
+from .db import get_db_connection
 import random
 import json
+
 
 class ModelManager:
     def __init__(self):
@@ -46,40 +47,53 @@ class ModelManager:
             'tat_predicted'
         ]]
         label = self.kmeans.predict(df_kmeans)[0]
-        if label == 3:
+        if label == HIGH_PRIORITY_LABEL:
             if self.high_priority == 3:
-                label = 2
+                label = SECONDARY_PRIORITY_LABEL
             else:
                 self.high_priority += 1
 
         nice_val = random.randint(*LABELS_DICT.get(label, (0, 0)))
         pid_start_times[proc_info['pid']] = (
             creation_time, proc_info, nice_val, label, tat_pred[0])
+
+        # Signal the rebalancer that a new process was added
+        # Import here to avoid circular dependency
+        try:
+            from .rebalance import signal_new_process
+            signal_new_process()
+        except ImportError:
+            log.warning("[ML] Could not signal rebalancer due to import issue")
+
         log.debug(f"[ML] Predicted nice value: {nice_val}, label: {label}")
         return nice_val
 
     def incremental_retrain(self, extra_trees: int = 5, learning_rate: float = 0.05):
         """
         Incrementally retrain the XGBoost model with new data from the database.
-        
+
         Args:
             extra_trees (int): Number of new trees to add.
             learning_rate (float): Learning rate for incremental training.
         """
-        log.info("[INCREMENTAL] Checking for new training data...")
+        # Convert to debug - very frequent
+        log.debug("[INCREMENTAL] Checking for new training data...")
 
         df_new = self._fetch_untrained_data()
         if df_new.empty:
-            log.info("[INCREMENTAL] No new data to retrain on.")
+            # Convert to debug - frequent when no data
+            log.debug("[INCREMENTAL] No new data to retrain on.")
             return
 
         try:
             X_scaled, y = self._prepare_training_data(df_new)
-            log.debug(f"[INCREMENTAL] New data prepared with {len(df_new)} samples.")
+            log.debug(
+                f"[INCREMENTAL] New data prepared with {len(df_new)} samples.")
             booster = self.model.get_booster()
             updated_model = self._build_incremental_model(
                 extra_trees, learning_rate)
-            log.debug(f"[INCREMENTAL] Building updated model with {extra_trees} extra trees.")
+            log.debug(
+                f"[INCREMENTAL] Building updated model with {extra_trees} extra trees.")
             updated_model.fit(X_scaled, y, xgb_model=booster)
             log.debug("[INCREMENTAL] Model updated with new data.")
             # Save backup of the model
@@ -99,6 +113,7 @@ class ModelManager:
 
     def _fetch_untrained_data(self) -> pd.DataFrame:
         """Fetch new process data that hasn't been used for retraining."""
+        conn, cursor = get_db_connection()
         query = "SELECT * FROM processes WHERE retrained = 0 AND tat IS NOT NULL"
         return pd.read_sql_query(query, conn)
 
@@ -110,14 +125,16 @@ class ModelManager:
             'gnu.version', 'gnu.version_r', 'got', 'init', 'init_array', 'plt',
             'rela.dyn', 'rela.plt', 'shstrtab', 'strtab', 'text', 'input_size'
         ]
-        log.debug(f"[INCREMENTAL] Preparing training data with columns: {df.columns.tolist()}")
+        log.debug(
+            f"[INCREMENTAL] Preparing training data with columns: {df.columns.tolist()}")
         df = df.rename(columns={
             'gnu_version': 'gnu.version',
             'gnu_version_r': 'gnu.version_r',
             'rela_dyn': 'rela.dyn',
             'rela_plt': 'rela.plt'
         })
-        log.debug(f"[INCREMENTAL] Renamed columns for consistency: {df.columns.tolist()}")
+        log.debug(
+            f"[INCREMENTAL] Renamed columns for consistency: {df.columns.tolist()}")
         X = df[feature_cols].copy()
         X['vmsXmemorydata'] = X['memory_vms'] * X['memory_data']
         X['squaredmemorydata'] = X['memory_data'] ** 2
@@ -157,6 +174,7 @@ class ModelManager:
 
     def _mark_data_as_retrained(self):
         """Mark all new samples in the database as retrained."""
+        conn, cursor = get_db_connection()
         cursor.execute(
             "UPDATE processes SET retrained = 1 WHERE retrained = 0")
         conn.commit()
@@ -164,12 +182,14 @@ class ModelManager:
     def _update_kmeans(self, df_new: pd.DataFrame, X_scaled):
         """Update the KMeans model with new features."""
         # log cols name debug
-        log.debug(f"[KMEANS] Updating KMeans with new data columns: {df_new.columns.tolist()}")
+        log.debug(
+            f"[KMEANS] Updating KMeans with new data columns: {df_new.columns.tolist()}")
 
         df_new['tat_predicted'] = self.model.predict(X_scaled)
         # log debug for tat_predicted
-        log.debug(f"[KMEANS] New data with tat_predicted: {df_new[['tat_predicted']].head()}")
-        # Check KMeans features 
+        log.debug(
+            f"[KMEANS] New data with tat_predicted: {df_new[['tat_predicted']].head()}")
+        # Check KMeans features
         log.debug(f"[KMEANS] KMeans features: {self.kmeans.feature_names_in_}")
         kmeans_features = [
             'io_read_count', 'io_write_count', 'io_write_bytes', 'bss', 'data',
@@ -191,4 +211,3 @@ class ModelManager:
         self.kmeans.partial_fit(df_kmeans)
         joblib.dump(self.kmeans, KMEANS_PATH)
         log.info("[KMEANS] KMeans model updated with new data.")
-

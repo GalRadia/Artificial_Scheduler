@@ -20,7 +20,7 @@ def get_elf_data(file_path):
                     parts = line.split()
                     if len(parts) > 4:
                         try:
-                            elf_data[key] = int(parts[4], 16)
+                            elf_data[key] = int(parts[4], 16) # Convert hex to int
                         except ValueError:
                             pass
     except Exception as e:
